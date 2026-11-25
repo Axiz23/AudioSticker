@@ -57,11 +57,12 @@ func (b *Bot) runTool(ctx context.Context, prog string, args ...string) ([]byte,
 
 	out, err := cmd.Output()
 	if err != nil {
-		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%s timed out", prog)
-		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, ctx.Err() // whole job timed out or the bot is shutting down
+		}
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+			b.log.Error("tool timed out", "tool", prog, "limit", b.cfg.FFTimeout)
+			return nil, userError("conversion took too long, try a shorter video")
 		}
 		tail := strings.TrimSpace(stderr.String())
 		if r := []rune(tail); len(r) > 300 {
@@ -126,7 +127,7 @@ func (b *Bot) toWebp(ctx context.Context, dir string, v visualSrc, length float6
 	out := filepath.Join(dir, "sticker.webp")
 	tiers := []struct{ fps, quality int }{{15, 60}, {12, 45}, {10, 35}, {8, 25}, {8, 15}}
 	for _, t := range tiers {
-		vf := fmt.Sprintf("fps=%d,scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,"+
+		vf := fmt.Sprintf("fps=%d,scale=512:512:force_original_aspect_ratio=decrease:flags=bicubic,"+
 			"format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000", t.fps)
 
 		args := []string{"-hide_banner", "-loglevel", "error", "-y", "-threads", "2"}
@@ -138,7 +139,7 @@ func (b *Bot) toWebp(ctx context.Context, dir string, v visualSrc, length float6
 			"-t", secs(length), "-i", v.path,
 			"-an", "-vf", vf,
 			"-c:v", "libwebp", "-lossless", "0", "-q:v", strconv.Itoa(t.quality),
-			"-compression_level", "6", "-loop", "0",
+			"-compression_level", "4", "-loop", "0",
 			out)
 
 		if _, err := b.runTool(ctx, "ffmpeg", args...); err != nil {
@@ -204,13 +205,18 @@ func (b *Bot) render(ctx context.Context, dir string, v visualSrc, audioPath str
 		length = info.Duration
 	}
 
+	t0 := time.Now()
 	opus, seconds, err := b.toOpus(ctx, dir, audioPath, length)
 	if err != nil {
 		return nil, err
 	}
+	t1 := time.Now()
 	webp, animated, err := b.toWebp(ctx, dir, v, math.Min(length, b.cfg.StickerSecs))
 	if err != nil {
 		return nil, err
 	}
+	b.log.Info("converted",
+		"audio_ms", t1.Sub(t0).Milliseconds(), "webp_ms", time.Since(t1).Milliseconds(),
+		"webp_kb", len(webp)/1024, "secs", seconds)
 	return &rendered{webp: webp, animated: animated, opus: opus, seconds: seconds}, nil
 }

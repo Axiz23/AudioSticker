@@ -43,7 +43,7 @@ func loadConfig() *Config {
 		SessionTTL:  time.Duration(envInt("SESSION_SECS", 120)) * time.Second,
 		StickerSecs: float64(envInt("STICKER_MAX_SECS", 5)),
 		AudioSecs:   float64(envInt("AUDIO_MAX_SECS", 5)),
-		MaxInput:    int64(envInt("MAX_INPUT_MB", 25)) << 20,
+		MaxInput:    int64(envInt("MAX_INPUT_MB", 16)) << 20,
 
 		Workers:     workers,
 		MaxJobs:     envInt("MAX_JOBS", workers*8),
