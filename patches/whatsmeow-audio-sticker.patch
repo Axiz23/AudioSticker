@@ -1,0 +1,34 @@
+--- w/whatsmeow-main/send.go	2026-11-24 17:21:53.000000000 +0000
++++ audio-sticker-bot/third_party/whatsmeow/send.go	2026-11-25 07:34:03.014628868 +0000
+@@ -939,6 +939,8 @@
+ 		return getTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
+ 	case msg.LottieStickerMessage != nil:
+ 		return getTypeFromMessage(msg.LottieStickerMessage.Message)
++	case msg.AudioStickerMessage != nil:
++		return getTypeFromMessage(msg.AudioStickerMessage.Message)
+ 	case msg.EphemeralMessage != nil:
+ 		return getTypeFromMessage(msg.EphemeralMessage.Message)
+ 	case msg.DocumentWithCaptionMessage != nil:
+@@ -966,6 +968,8 @@
+ 		return getMediaTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
+ 	case msg.LottieStickerMessage != nil:
+ 		return getMediaTypeFromMessage(msg.LottieStickerMessage.Message)
++	case msg.AudioStickerMessage != nil:
++		return getMediaTypeFromMessage(msg.AudioStickerMessage.Message)
+ 	case msg.EphemeralMessage != nil:
+ 		return getMediaTypeFromMessage(msg.EphemeralMessage.Message)
+ 	case msg.DocumentWithCaptionMessage != nil:
+--- /dev/null	2026-11-25 00:16:33.953056642 +0000
++++ audio-sticker-bot/third_party/whatsmeow/audiostickercheck.go	2026-11-25 07:35:31.011686213 +0000
+@@ -0,0 +1,11 @@
++package whatsmeow
++
++import "go.mau.fi/whatsmeow/proto/waE2E"
++
++// StanzaTypesOf reports the stanza "type" and "mediatype" attributes that SendMessage
++// would use for msg. It exists so that applications can verify at startup that this
++// copy of whatsmeow understands the audioStickerMessage wrapper (field 134).
++// For a correct build, an audio sticker gives ("media", "sticker").
++func StanzaTypesOf(msg *waE2E.Message) (stanzaType, mediaType string) {
++	return getTypeFromMessage(msg), getMediaTypeFromMessage(msg)
++}
