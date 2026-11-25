@@ -20,6 +20,7 @@ type Config struct {
 	StickerSecs float64       // max length of the animated sticker
 	AudioSecs   float64       // max length of the audio
 	MaxInput    int64         // max size of a downloaded input file, in bytes
+	MaxStickerBytes int       // max size of the output WebP; the encoder lowers fps/quality to fit
 
 	Workers     int           // ffmpeg/ffprobe processes running at the same time
 	MaxJobs     int           // jobs in flight (running + waiting for a worker)
@@ -44,6 +45,7 @@ func loadConfig() *Config {
 		StickerSecs: float64(envInt("STICKER_MAX_SECS", 5)),
 		AudioSecs:   float64(envInt("AUDIO_MAX_SECS", 5)),
 		MaxInput:    int64(envInt("MAX_INPUT_MB", 16)) << 20,
+		MaxStickerBytes: envInt("STICKER_MAX_KB", 500) * 1024,
 
 		Workers:     workers,
 		MaxJobs:     envInt("MAX_JOBS", workers*8),

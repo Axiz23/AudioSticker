@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-const maxStickerBytes = 500 * 1024
-
 // userError is an error whose text is safe and useful to show in the chat.
 type userError string
 
@@ -116,10 +114,10 @@ type visualSrc struct {
 	size     int64
 }
 
-// toWebp makes a 512x512 animated WebP of at most maxStickerBytes. A sticker that is
+// toWebp makes a 512x512 animated WebP of at most cfg.MaxStickerBytes. A sticker that is
 // already small enough is used as is.
 func (b *Bot) toWebp(ctx context.Context, dir string, v visualSrc, length float64) ([]byte, bool, error) {
-	if v.kind == kindSticker && v.size <= maxStickerBytes {
+	if v.kind == kindSticker && v.size <= int64(b.cfg.MaxStickerBytes) {
 		data, err := os.ReadFile(v.path)
 		return data, v.animated, err
 	}
@@ -149,11 +147,11 @@ func (b *Bot) toWebp(ctx context.Context, dir string, v visualSrc, length float6
 		if err != nil {
 			return nil, false, err
 		}
-		if len(data) <= maxStickerBytes {
+		if len(data) <= b.cfg.MaxStickerBytes {
 			return data, true, nil
 		}
 	}
-	return nil, false, userError("sticker is over 500 KB, use a shorter video")
+	return nil, false, userError(fmt.Sprintf("sticker is over %d KB, use a shorter video", b.cfg.MaxStickerBytes/1024))
 }
 
 // toOpus extracts the first audio stream of in (an audio file or a video) as Ogg Opus
