@@ -1,3 +1,6 @@
+//! WhatsApp sound sticker bot: reply to a video/GIF and an audio with `.sa`.
+//! Needs `ffmpeg` and `ffprobe` in PATH.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,23 +15,16 @@ use whatsapp_rust::download::{DownloadLimits, MediaType};
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::*;
 
-const MAX_ANIMATED_STICKER_BYTES: usize = 500 * 1024; // batas WhatsApp untuk animated sticker
+const MAX_STICKER_BYTES: usize = 500 * 1024;
 const MAX_INPUT_BYTES: usize = 25 * 1024 * 1024;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(90);
-
-const HELP: &str = "Cara pakai:\n\
-1. Kirim video/GIF/WebM dan audio ke chat ini.\n\
-2. Reply video dengan *.sa*\n\
-3. Reply audio dengan *.sa*\n\
-Setelah keduanya masuk, saya kirim sticker beraudio.\n\
-*.sa reset* untuk membatalkan sesi.";
-
-// ───────────────────────── konfigurasi & sesi ─────────────────────────
+const USAGE: &str = "Reply to a video/GIF/WebM/sticker and an audio with .sa";
 
 struct Config {
     session_ttl: Duration,
-    sticker_max_secs: u32,
-    audio_max_secs: u32,
+    sticker_secs: u32,
+    audio_secs: u32,
+    diag: bool,
 }
 
 impl Config {
@@ -36,16 +32,16 @@ impl Config {
         let num = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         Self {
             session_ttl: Duration::from_secs(u64::from(num("SESSION_SECS", 120))),
-            sticker_max_secs: num("STICKER_MAX_SECS", 5),
-            audio_max_secs: num("AUDIO_MAX_SECS", 5),
+            sticker_secs: num("STICKER_MAX_SECS", 5),
+            audio_secs: num("AUDIO_MAX_SECS", 5),
+            diag: std::env::var("DIAG").is_ok_and(|v| v == "1"),
         }
     }
 }
 
 struct Visual {
     bytes: Vec<u8>,
-    /// Sudah berupa WebP (dari sticker): dipakai langsung bila ukurannya muat.
-    is_webp_sticker: bool,
+    is_webp: bool,
 }
 
 struct Session {
@@ -66,71 +62,41 @@ enum Outcome {
     Waiting(&'static str),
 }
 
-// ───────────────────────── handler pesan ─────────────────────────
-
-/// `.sa` -> Some(""), `.sa reset` -> Some("reset"), selain itu None.
 fn parse_command(text: &str) -> Option<&str> {
     let rest = text.trim().strip_prefix(".sa")?;
-    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-        Some(rest.trim())
-    } else {
-        None
-    }
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 async fn say(ctx: &MessageContext, text: &str) {
     if let Err(e) = ctx.reply_quoting(text).await {
-        warn!("gagal membalas: {e}");
+        warn!("reply failed: {e}");
     }
 }
 
 async fn handle(ctx: MessageContext, sessions: Sessions, cfg: Arc<Config>) {
-    let Some(text) = ctx.message.text_content() else {
-        return;
-    };
-    let Some(arg) = parse_command(text) else {
+    let Some(arg) = ctx.message.text_content().and_then(parse_command) else {
         return;
     };
     let key = format!("{}/{}", ctx.info.source.chat, ctx.info.source.sender);
 
-    match arg {
-        "" => {}
-        "reset" => {
-            sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
-            say(&ctx, "Sesi dihapus.").await;
-            return;
-        }
-        _ => {
-            say(&ctx, HELP).await;
-            return;
-        }
+    if arg == "reset" {
+        sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        say(&ctx, "Session cleared").await;
+        return;
     }
 
-    let Some(quoted) = ctx
-        .message
-        .context_info()
-        .and_then(|c| c.quoted_message.as_option())
-    else {
-        say(&ctx, HELP).await;
+    let Some(quoted) = ctx.message.context_info().and_then(|c| c.quoted_message.as_option()) else {
+        say(&ctx, USAGE).await;
         return;
     };
 
     let slot = match fetch_media(&ctx.client, quoted).await {
         Ok(Some(slot)) => slot,
-        Ok(None) => {
-            say(&ctx, "Pesan yang di-reply harus berupa video/GIF/WebM/sticker atau audio.").await;
-            return;
-        }
+        Ok(None) => return say(&ctx, USAGE).await,
         Err(e) => {
-            error!("ambil media gagal: {e:#}");
-            say(&ctx, "Gagal mengunduh media itu. Coba kirim ulang filenya.").await;
-            return;
+            error!("download failed: {e:#}");
+            return say(&ctx, "Could not download that media").await;
         }
-    };
-
-    let got = match &slot {
-        Slot::Visual(_) => "visual",
-        Slot::Audio(_) => "audio",
     };
 
     let outcome = {
@@ -150,39 +116,29 @@ async fn handle(ctx: MessageContext, sessions: Sessions, cfg: Arc<Config>) {
         match (s.visual.is_some(), s.audio.is_some()) {
             (true, true) => match map.remove(&key) {
                 Some(Session { visual: Some(v), audio: Some(a), .. }) => Outcome::Ready(v, a),
-                _ => Outcome::Waiting("visual/audio"),
+                _ => return,
             },
             (true, false) => Outcome::Waiting("audio"),
-            _ => Outcome::Waiting("video/GIF/WebM"),
+            _ => Outcome::Waiting("video/GIF"),
         }
     };
 
     match outcome {
-        Outcome::Waiting(missing) => {
-            let secs = cfg.session_ttl.as_secs();
-            say(
-                &ctx,
-                &format!("{got} diterima. Sekarang reply {missing} dengan .sa (maks {secs} detik)."),
-            )
-            .await;
-        }
+        Outcome::Waiting(missing) => say(&ctx, &format!("Now reply the {missing} with .sa")).await,
         Outcome::Ready(visual, audio) => {
-            say(&ctx, "Memproses sticker beraudio…").await;
             if let Err(e) = merge_and_send(&ctx, visual, audio, &cfg).await {
-                error!("merge/kirim gagal: {e:#}");
-                say(&ctx, &format!("Gagal membuat sticker: {e}")).await;
+                error!("send failed: {e:#}");
+                say(&ctx, &format!("Failed: {e}")).await;
             }
         }
     }
 }
 
-// ───────────────────────── unduh media ─────────────────────────
-
 async fn fetch_media(client: &Client, quoted: &wa::Message) -> Result<Option<Slot>> {
     let base = quoted.get_base_message();
     let limits = DownloadLimits::default();
 
-    let (slot_is_visual, is_webp_sticker, bytes) = if let Some(v) = base.video_message.as_option() {
+    let (is_visual, is_webp, bytes) = if let Some(v) = base.video_message.as_option() {
         (true, false, client.download(v, limits).await)
     } else if let Some(i) = base.image_message.as_option() {
         (true, false, client.download(i, limits).await)
@@ -191,7 +147,6 @@ async fn fetch_media(client: &Client, quoted: &wa::Message) -> Result<Option<Slo
     } else if let Some(a) = base.audio_message.as_option() {
         (false, false, client.download(a, limits).await)
     } else if let Some(d) = base.document_message.as_option() {
-        // WebM/GIF/audio sering terkirim sebagai dokumen.
         let mime = d.mimetype.as_deref().unwrap_or("");
         let visual = mime.starts_with("video/") || mime.starts_with("image/");
         if !visual && !mime.starts_with("audio/") {
@@ -204,16 +159,14 @@ async fn fetch_media(client: &Client, quoted: &wa::Message) -> Result<Option<Slo
 
     let bytes = bytes.map_err(|e| anyhow!("download: {e:?}"))?;
     if bytes.len() > MAX_INPUT_BYTES {
-        bail!("file terlalu besar ({} MB)", bytes.len() / 1024 / 1024);
+        bail!("file too large");
     }
-    Ok(Some(if slot_is_visual {
-        Slot::Visual(Visual { bytes, is_webp_sticker })
+    Ok(Some(if is_visual {
+        Slot::Visual(Visual { bytes, is_webp })
     } else {
         Slot::Audio(bytes)
     }))
 }
-
-// ───────────────────────── konversi ffmpeg ─────────────────────────
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -221,14 +174,12 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Result<Self> {
-        let p = std::env::temp_dir().join(format!(
-            "wa-sa-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wa-sa-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&p)?;
         Ok(Self(p))
     }
+
     fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -240,31 +191,26 @@ impl Drop for TempDir {
     }
 }
 
-fn tail(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(b);
-    let n = s.chars().count();
-    s.chars().skip(n.saturating_sub(400)).collect()
+fn s(x: impl ToString) -> String {
+    x.to_string()
 }
 
 async fn run(program: &str, args: &[String]) -> Result<std::process::Output> {
     let fut = Command::new(program).args(args).kill_on_drop(true).output();
     let out = tokio::time::timeout(FFMPEG_TIMEOUT, fut)
         .await
-        .map_err(|_| anyhow!("{program} timeout"))?
-        .with_context(|| format!("tidak bisa menjalankan {program} (sudah terpasang di PATH?)"))?;
+        .map_err(|_| anyhow!("{program} timed out"))?
+        .with_context(|| format!("cannot run {program}"))?;
     if !out.status.success() {
-        bail!("{program} gagal: {}", tail(&out.stderr));
+        let err = String::from_utf8_lossy(&out.stderr);
+        let n = err.chars().count();
+        bail!("{program} failed: {}", err.chars().skip(n.saturating_sub(300)).collect::<String>());
     }
     Ok(out)
 }
 
-fn s(x: impl ToString) -> String {
-    x.to_string()
-}
-
-/// Visual apa pun -> animated WebP 512x512 <= 500 KB (turunkan fps/kualitas bertahap).
 async fn to_animated_webp(dir: &TempDir, visual: &Visual, max_secs: u32) -> Result<Vec<u8>> {
-    if visual.is_webp_sticker && visual.bytes.len() <= MAX_ANIMATED_STICKER_BYTES {
+    if visual.is_webp && visual.bytes.len() <= MAX_STICKER_BYTES {
         return Ok(visual.bytes.clone());
     }
     let input = dir.join("visual.in");
@@ -281,23 +227,20 @@ async fn to_animated_webp(dir: &TempDir, visual: &Visual, max_secs: u32) -> Resu
             "-t", &max_secs.to_string(),
             "-i", input.to_str().unwrap_or_default(),
             "-an", "-vf", &vf,
-            "-c:v", "libwebp", "-lossless", "0",
-            "-q:v", &quality.to_string(),
+            "-c:v", "libwebp", "-lossless", "0", "-q:v", &quality.to_string(),
             "-compression_level", "6", "-loop", "0",
             output.to_str().unwrap_or_default(),
         ]
         .map(s);
         run("ffmpeg", &args).await?;
         let webp = tokio::fs::read(&output).await?;
-        if webp.len() <= MAX_ANIMATED_STICKER_BYTES {
+        if webp.len() <= MAX_STICKER_BYTES {
             return Ok(webp);
         }
-        info!("webp {} KB > 500 KB, turunkan fps/kualitas", webp.len() / 1024);
     }
-    bail!("tidak bisa mengecilkan sticker di bawah 500 KB; pakai video yang lebih pendek");
+    bail!("sticker is over 500 KB, use a shorter video")
 }
 
-/// Audio apa pun -> Ogg Opus mono (format yang dipakai sticker beraudio asli).
 async fn to_opus(dir: &TempDir, audio: &[u8], max_secs: u32) -> Result<(Vec<u8>, u32)> {
     let input = dir.join("audio.in");
     let output = dir.join("audio.ogg");
@@ -306,8 +249,7 @@ async fn to_opus(dir: &TempDir, audio: &[u8], max_secs: u32) -> Result<(Vec<u8>,
         "-hide_banner", "-loglevel", "error", "-y",
         "-t", &max_secs.to_string(),
         "-i", input.to_str().unwrap_or_default(),
-        "-vn", "-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1",
-        "-f", "ogg",
+        "-vn", "-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "ogg",
         output.to_str().unwrap_or_default(),
     ]
     .map(s);
@@ -327,31 +269,23 @@ async fn to_opus(dir: &TempDir, audio: &[u8], max_secs: u32) -> Result<(Vec<u8>,
     Ok((tokio::fs::read(&output).await?, secs))
 }
 
-// ───────────────────────── upload & kirim ─────────────────────────
-
-async fn merge_and_send(
-    ctx: &MessageContext,
-    visual: Visual,
-    audio: Vec<u8>,
-    cfg: &Config,
-) -> Result<()> {
+async fn merge_and_send(ctx: &MessageContext, visual: Visual, audio: Vec<u8>, cfg: &Config) -> Result<()> {
     let dir = TempDir::new()?;
-    let webp = to_animated_webp(&dir, &visual, cfg.sticker_max_secs).await?;
-    let (opus, seconds) = to_opus(&dir, &audio, cfg.audio_max_secs).await?;
-    info!("sticker {} KB, audio {} KB ({}s)", webp.len() / 1024, opus.len() / 1024, seconds);
+    let webp = to_animated_webp(&dir, &visual, cfg.sticker_secs).await?;
+    let (opus, seconds) = to_opus(&dir, &audio, cfg.audio_secs).await?;
+    let sizes = (webp.len() / 1024, opus.len() / 1024);
 
     let sticker_up = ctx
         .client
         .upload(webp, MediaType::Sticker, UploadOptions::default())
         .await
-        .context("upload sticker")?;
+        .context("sticker upload")?;
     let audio_up = ctx
         .client
         .upload(opus, MediaType::Audio, UploadOptions::default())
         .await
-        .context("upload audio")?;
+        .context("audio upload")?;
 
-    // AudioMessage di dalam StickerMessage. Sample asli tidak punya ptt/waveform/sidecar.
     let mut audio_msg = wa::message::AudioMessage::default();
     audio_msg.url = Some(audio_up.url);
     audio_msg.direct_path = Some(audio_up.direct_path);
@@ -380,6 +314,20 @@ async fn merge_and_send(
     sticker.height = Some(512);
     sticker.is_animated = Some(true);
     sticker.sticker_sent_ts = Some(now_ms);
+
+    if cfg.diag {
+        let mut plain_sticker = wa::Message::default();
+        plain_sticker.sticker_message = MessageField::some(sticker.clone());
+        let mut plain_audio = wa::Message::default();
+        plain_audio.audio_message = MessageField::some(audio_msg.clone());
+        for (name, msg) in [("plain sticker", plain_sticker), ("plain audio", plain_audio)] {
+            match ctx.send_message(msg).await {
+                Ok(_) => info!("diag: {name} sent"),
+                Err(e) => error!("diag: {name} failed: {e}"),
+            }
+        }
+    }
+
     sticker.audio = Some(wa::message::sticker_message::Audio::AudioMessage(Box::new(audio_msg)));
 
     let mut inner = wa::Message::default();
@@ -389,16 +337,32 @@ async fn merge_and_send(
     let mut msg = wa::Message::default();
     msg.audio_sticker_message = MessageField::some(wrapper);
 
-    let sent = ctx.send_message(msg).await.context("kirim audioStickerMessage")?;
-    info!("sticker beraudio terkirim: {}", sent.message_id);
+    ctx.send_message(msg).await.context("send")?;
+    info!("audio sticker sent (webp {} KB, opus {} KB, {seconds}s)", sizes.0, sizes.1);
     Ok(())
 }
 
-// ───────────────────────── main ─────────────────────────
+fn self_check() {
+    let mut inner = wa::Message::default();
+    inner.sticker_message = MessageField::some(Default::default());
+    let mut wrapper = wa::message::FutureProofMessage::default();
+    wrapper.message = MessageField::some(inner);
+    let mut msg = wa::Message::default();
+    msg.audio_sticker_message = MessageField::some(wrapper);
+
+    let media = whatsapp_rust::wacore::send::media_type_from_message(&msg);
+    let kind = whatsapp_rust::wacore::send::stanza_type_from_message(&msg);
+    if media == Some("sticker") && kind == "media" {
+        info!("self-check ok");
+    } else {
+        error!("self-check failed (type={kind}, mediatype={media:?}): outdated whatsapp-rust, run `cargo update -p whatsapp-rust`");
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    self_check();
 
     let db = std::env::var("WA_DB").unwrap_or_else(|_| "whatsapp.db".into());
     let sessions: Sessions = Arc::default();
@@ -406,13 +370,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut builder = Bot::builder()
         .with_backend(SqliteStore::open(&db).await?)
-        .on_qr_code(|code, timeout| async move {
-            println!("Scan QR (berlaku {} detik):\n{code}", timeout.as_secs());
-        })
-        .on_pair_code(|code, _| async move {
-            println!("Pair code: {code}  (WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon)");
-        })
-        .on_connected(|_| async { info!("Terhubung.") })
+        .on_qr_code(|code, _| async move { println!("{code}") })
+        .on_pair_code(|code, _| async move { println!("Pair code: {code}") })
+        .on_connected(|_| async { info!("connected") })
         .on_message({
             let sessions = sessions.clone();
             let cfg = cfg.clone();
