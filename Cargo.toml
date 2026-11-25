@@ -5,9 +5,6 @@ edition = "2024"
 rust-version = "1.95"
 
 [dependencies]
-# Harus memuat fix audio_sticker_message di wrapper list (proto_helpers.rs / classify.rs).
-# Rev di README library bisa lebih lama dari fix itu, jadi pakai main.
-# Setelah mengubah ini: `cargo update -p whatsapp-rust` agar Cargo.lock ikut berubah.
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time", "fs"] }
 anyhow = "1"
