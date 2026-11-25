@@ -34,8 +34,17 @@ func main() {
 }
 
 func run() error {
+	// Load .env first: it can set LOG_LEVEL and every other option.
+	envFile := envStr("ENV_FILE", ".env")
+	loaded, envErr := loadDotEnv(envFile)
+
 	cfg := loadConfig()
 	log := newLogger(cfg.LogLevel)
+	if envErr != nil {
+		log.Warn("could not read env file", "file", envFile, "err", envErr)
+	} else if loaded > 0 {
+		log.Info("env file loaded", "file", envFile, "vars", loaded)
+	}
 
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
 		if _, err := exec.LookPath(tool); err != nil {
